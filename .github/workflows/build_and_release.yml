@@ -413,6 +413,9 @@ jobs:
             [ -d "${HOMEBREW_PREFIX}/opt/$p/include" ] && KEG_INC="${KEG_INC} -I${HOMEBREW_PREFIX}/opt/$p/include"
             [ -d "${HOMEBREW_PREFIX}/opt/$p/lib" ] && KEG_LIB="${KEG_LIB} -L${HOMEBREW_PREFIX}/opt/$p/lib"
           done
+          # raptor2 的头文件在 include/raptor2 子目录下（lrdf.h 直接 #include <raptor.h>）
+          [ -d "${HOMEBREW_PREFIX}/opt/raptor/include/raptor2" ] && \
+            KEG_INC="${KEG_INC} -I${HOMEBREW_PREFIX}/opt/raptor/include/raptor2"
           # -DDISABLE_VISIBILITY：内置 gdk/gtk 分支的符号别名机制
           # （__attribute__((alias))）在 darwin/clang 上不受支持；官方依赖栈的
           # glib 不启用 visibility 宏所以不触发，Homebrew 的 glib 会触发
@@ -625,6 +628,18 @@ jobs:
           # 会因 PATH 条目丢失而找不到 gcc/git。
           PY=/usr/bin/python3
           "$PY" -V
+          # msys2 的 fftw 包链接时缺 fftwf_make_planner_thread_safe 符号，
+          # 从源码构建单精度 fftw 覆盖安装到 /mingw64（论坛验证过的解法）
+          mkdir -p /tmp/fftw && cd /tmp/fftw
+          curl -sSfLO https://www.fftw.org/fftw-3.3.10.tar.gz
+          tar xf fftw-3.3.10.tar.gz
+          cd fftw-3.3.10
+          ./configure --with-pic --enable-sse2 --enable-avx --enable-avx2 \
+            --enable-float --enable-threads --with-combined-threads \
+            --disable-fortran --prefix=/mingw64 > /dev/null
+          make -j"$(nproc)" > /dev/null
+          make install > /dev/null
+          cd - > /dev/null
           "$PY" ./waf configure \
             --dist-target=mingw \
             --prefix="$PWD/install" \
