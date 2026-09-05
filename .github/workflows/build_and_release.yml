@@ -608,11 +608,15 @@ jobs:
           set -euo pipefail
           cd ardour
           PY="$(command -v python3 || command -v python)"
+          NPROC="$(nproc)"
           echo "使用 Python：${PY}"
-          # runner 的 PATH 里带有 MSVC，必须显式指定 mingw gcc，
-          # 否则 waf（原生 Windows python）会优先检测到 MSVC
-          export CC=gcc
-          export CXX=g++
+          # 关键：waf 由原生 Windows python 运行，其子进程（gcc/ar/pkg-config
+          # 等检测）用 Windows 格式 PATH 搜索。MSYS2 的 POSIX PATH 传给原生
+          # 子进程时会丢失 /mingw64/bin 等条目，因此为 waf 显式导出 Windows
+          # 格式 PATH（分号分隔），确保能找到 mingw64 的 gcc/ar/pkg-config。
+          MINGW_BIN="$(cygpath -m /mingw64/bin)"
+          MSYS_BIN="$(cygpath -m /usr/bin)"
+          export PATH="${MINGW_BIN};${MSYS_BIN};C:\\Windows\\System32;C:\\Windows"
           # mingw python 是原生 Windows 程序，--prefix 必须用 Windows 路径
           PREFIX_WIN="$(cygpath -m "$PWD")/install"
           "$PY" ./waf configure \
@@ -623,7 +627,7 @@ jobs:
             --optimize \
             --ptformat \
             --with-backends=portaudio,jack,dummy
-          "$PY" ./waf -j"$(nproc)"
+          "$PY" ./waf -j"$NPROC"
           "$PY" ./waf install
 
       - name: 打包 (Windows)
