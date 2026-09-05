@@ -638,11 +638,17 @@ jobs:
           tar xf fftw.tar.gz
           cd fftw-3.3.10
           ./configure --with-pic --enable-sse2 --enable-avx --enable-avx2 \
-            --enable-float --enable-threads --with-combined-threads \
+            --enable-float --enable-threads \
             --with-our-malloc16 --disable-fortran --prefix=/mingw64 > /dev/null
           make -j"$(nproc)" > /dev/null
           make install > /dev/null
           cd "$SRC"
+          # ardour 的 wscript 在 mingw 下故意不链接 fftw3f_threads，导致
+          # fftwf_make_planner_thread_safe 未定义（msys2 PKGBUILD 同样打此补丁）
+          sed -i "s/ and bld.env\['build_target'\] != 'mingw' and bld.env\['build_target'\] != 'msvc'//" \
+            libs/audiographer/wscript
+          sed -i "s/ and not (bld.env\['build_target'\] == 'mingw' and sys.platform != 'win32') and bld.env\['build_target'\] != 'msvc'//" \
+            gtk2_ardour/wscript
           "$PY" ./waf configure \
             --dist-target=mingw \
             --prefix="$PWD/install" \
