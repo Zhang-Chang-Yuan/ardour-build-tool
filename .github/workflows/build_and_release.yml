@@ -538,7 +538,7 @@ jobs:
       # =====================================================================
       - name: 安装 MSYS2 与依赖 (Windows)
         if: runner.os == 'Windows'
-        uses: msys2-actions/setup-msys2@v2
+        uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: false
