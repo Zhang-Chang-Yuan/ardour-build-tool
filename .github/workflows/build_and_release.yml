@@ -402,15 +402,22 @@ jobs:
           cd ardour
           # Homebrew 里 libarchive/libxml2/curl/gettext 等是 keg-only，旧 API 版
           # GTK 绑定库（glibmm@2.66 等）也在 /opt 下，用通配把所有 opt 包的
-          # pkgconfig 目录都加入搜索路径；boost 检查不走 pkg-config，
-          # 需通过 CPPFLAGS/LDFLAGS 加入 Homebrew 前缀
+          # pkgconfig 目录都加入搜索路径；keg-only 头文件/库目录不在默认搜索
+          # 路径中，而 ardour 源码假定系统能直接 #include（Debian 下就在
+          # /usr/include），因此显式加入 CPPFLAGS/LDFLAGS
           HOMEBREW_PREFIX="$(brew --prefix)"
           export PKG_CONFIG_PATH="$(echo "${HOMEBREW_PREFIX}"/opt/*/lib/pkgconfig | tr ' ' ':'):${HOMEBREW_PREFIX}/lib/pkgconfig:/usr/lib/pkgconfig"
-          export CPPFLAGS="-I${HOMEBREW_PREFIX}/include -DDISABLE_VISIBILITY"
+          KEG_INC=""
+          KEG_LIB=""
+          for p in libarchive libxml2 curl gettext readline zlib openssl@3 icu4c; do
+            [ -d "${HOMEBREW_PREFIX}/opt/$p/include" ] && KEG_INC="${KEG_INC} -I${HOMEBREW_PREFIX}/opt/$p/include"
+            [ -d "${HOMEBREW_PREFIX}/opt/$p/lib" ] && KEG_LIB="${KEG_LIB} -L${HOMEBREW_PREFIX}/opt/$p/lib"
+          done
           # -DDISABLE_VISIBILITY：内置 gdk/gtk 分支的符号别名机制
           # （__attribute__((alias))）在 darwin/clang 上不受支持；官方依赖栈的
           # glib 不启用 visibility 宏所以不触发，Homebrew 的 glib 会触发
-          export LDFLAGS="-L${HOMEBREW_PREFIX}/lib"
+          export CPPFLAGS="-I${HOMEBREW_PREFIX}/include${KEG_INC} -DDISABLE_VISIBILITY"
+          export LDFLAGS="-L${HOMEBREW_PREFIX}/lib${KEG_LIB}"
           python3 ./waf configure \
             --prefix="$PWD/install" \
             --cxx17 \

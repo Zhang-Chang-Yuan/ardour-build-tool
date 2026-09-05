@@ -6,6 +6,9 @@ get() {
     "https://api.github.com/repos/Zhang-Chang-Yuan/ardour-build-tool/actions/runs?per_page=2"
 }
 seen_any=0
+TARGET_SHA=$(curl -sS -H "Authorization: Bearer $(printf "protocol=https\nhost=github.com\n\n" | git credential fill | grep '^password=' | cut -d= -f2-)" \
+  "https://api.github.com/repos/Zhang-Chang-Yuan/ardour-build-tool/commits/main" | uv run python -c "import json,sys; print(json.load(sys.stdin)['sha'][:7])")
+echo "target: $TARGET_SHA"
 for i in $(seq 1 60); do
   sleep 150
   summary=$(get | uv run python -c "
@@ -19,8 +22,7 @@ print('ROWS=' + str(len(rows)) + ' ACTIVE=' + str(len(active)))
   echo "=== poll $i $(date +%H:%M) ==="
   echo "$summary"
   if [ "$seen_any" = "0" ]; then
-    # 第一轮先确认有两个目标运行存在（af56e4f）
-    if echo "$summary" | grep -q "af56e4f"; then seen_any=1; fi
+    if [ "$(echo "$summary" | grep -c "$TARGET_SHA")" -ge 2 ]; then seen_any=1; fi
     continue
   fi
   if echo "$summary" | grep -q "ACTIVE=0"; then echo "ALL_COMPLETED"; break; fi
