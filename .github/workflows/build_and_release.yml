@@ -564,7 +564,7 @@ jobs:
           update: false
           release: false
           install: >-
-            git unzip make zip python
+            git unzip make zip python diffutils
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-python
             mingw-w64-x86_64-pkgconf
@@ -630,6 +630,7 @@ jobs:
           "$PY" -V
           # msys2 的 fftw 包链接时缺 fftwf_make_planner_thread_safe 符号，
           # 从源码构建单精度 fftw 覆盖安装到 /mingw64（论坛验证过的解法）
+          SRC="$PWD"
           mkdir -p /tmp/fftw && cd /tmp/fftw
           # fftw.org 在 GitHub runner 上经常不可达，使用 Debian 归档的镜像
           curl -sSfL --retry 3 -o fftw.tar.gz \
@@ -641,7 +642,7 @@ jobs:
             --with-our-malloc16 --disable-fortran --prefix=/mingw64 > /dev/null
           make -j"$(nproc)" > /dev/null
           make install > /dev/null
-          cd - > /dev/null
+          cd "$SRC"
           "$PY" ./waf configure \
             --dist-target=mingw \
             --prefix="$PWD/install" \
