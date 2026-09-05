@@ -631,8 +631,10 @@ jobs:
           # msys2 的 fftw 包链接时缺 fftwf_make_planner_thread_safe 符号，
           # 从源码构建单精度 fftw 覆盖安装到 /mingw64（论坛验证过的解法）
           mkdir -p /tmp/fftw && cd /tmp/fftw
-          curl -sSfLO https://www.fftw.org/fftw-3.3.10.tar.gz
-          tar xf fftw-3.3.10.tar.gz
+          # fftw.org 在 GitHub runner 上经常不可达，使用 Debian 归档的镜像
+          curl -sSfL --retry 3 -o fftw.tar.gz \
+            "https://deb.debian.org/debian/pool/main/f/fftw3/fftw3_3.3.10.orig.tar.gz"
+          tar xf fftw.tar.gz
           cd fftw-3.3.10
           ./configure --with-pic --enable-sse2 --enable-avx --enable-avx2 \
             --enable-float --enable-threads --with-combined-threads \
