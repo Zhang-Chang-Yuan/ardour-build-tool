@@ -636,7 +636,7 @@ jobs:
           cd fftw-3.3.10
           ./configure --with-pic --enable-sse2 --enable-avx --enable-avx2 \
             --enable-float --enable-threads --with-combined-threads \
-            --disable-fortran --prefix=/mingw64 > /dev/null
+            --with-our-malloc16 --disable-fortran --prefix=/mingw64 > /dev/null
           make -j"$(nproc)" > /dev/null
           make install > /dev/null
           cd - > /dev/null
