@@ -406,7 +406,10 @@ jobs:
           # 需通过 CPPFLAGS/LDFLAGS 加入 Homebrew 前缀
           HOMEBREW_PREFIX="$(brew --prefix)"
           export PKG_CONFIG_PATH="$(echo "${HOMEBREW_PREFIX}"/opt/*/lib/pkgconfig | tr ' ' ':'):${HOMEBREW_PREFIX}/lib/pkgconfig:/usr/lib/pkgconfig"
-          export CPPFLAGS="-I${HOMEBREW_PREFIX}/include"
+          export CPPFLAGS="-I${HOMEBREW_PREFIX}/include -DDISABLE_VISIBILITY"
+          # -DDISABLE_VISIBILITY：内置 gdk/gtk 分支的符号别名机制
+          # （__attribute__((alias))）在 darwin/clang 上不受支持；官方依赖栈的
+          # glib 不启用 visibility 宏所以不触发，Homebrew 的 glib 会触发
           export LDFLAGS="-L${HOMEBREW_PREFIX}/lib"
           python3 ./waf configure \
             --prefix="$PWD/install" \
@@ -551,7 +554,7 @@ jobs:
           update: false
           release: false
           install: >-
-            git unzip make zip
+            git unzip make zip python
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-python
             mingw-w64-x86_64-pkgconf
@@ -609,29 +612,21 @@ jobs:
         run: |
           set -euo pipefail
           cd ardour
-          PY="$(command -v python3 || command -v python)"
-          NPROC="$(nproc)"
-          echo "使用 Python：${PY}"
-          # mingw python 是原生 Windows 程序，--prefix 必须用 Windows 路径
-          PREFIX_WIN="$(cygpath -m "$PWD")/install"
-          # 关键：waf 由原生 Windows python 运行，其子进程（gcc/ar/pkg-config
-          # 等检测）用 Windows 格式 PATH 搜索。MSYS2 的 POSIX PATH 传给原生
-          # 子进程时会丢失 /mingw64/bin 等条目，因此为 waf 显式导出 Windows
-          # 格式 PATH（分号分隔），确保能找到 mingw64 的 gcc/ar/pkg-config。
-          # 注意：必须在所有 cygpath 调用之后覆盖 PATH（bash 按冒号解析 PATH，
-          # 覆盖后 bash 自身将无法再解析任何命令）。
-          MINGW_BIN="$(cygpath -m /mingw64/bin)"
-          MSYS_BIN="$(cygpath -m /usr/bin)"
-          export PATH="${MINGW_BIN};${MSYS_BIN};C:\\Windows\\System32;C:\\Windows"
+          # 使用 MSYS2 自带的 POSIX python 运行 waf：它的子进程（git/gcc/ar/
+          # pkg-config）走 MSYS2 的 POSIX PATH（运行时自动转换参数与路径），
+          # 能稳定找到 /mingw64/bin 下的工具链。mingw 原生 python 的子进程
+          # 会因 PATH 条目丢失而找不到 gcc/git。
+          PY=/usr/bin/python3
+          "$PY" -V
           "$PY" ./waf configure \
             --dist-target=mingw \
-            --prefix="$PREFIX_WIN" \
+            --prefix="$PWD/install" \
             --cxx17 \
             --no-phone-home \
             --optimize \
             --ptformat \
             --with-backends=portaudio,jack,dummy
-          "$PY" ./waf -j"$NPROC"
+          "$PY" ./waf -j"$(nproc)"
           "$PY" ./waf install
 
       - name: 打包 (Windows)
