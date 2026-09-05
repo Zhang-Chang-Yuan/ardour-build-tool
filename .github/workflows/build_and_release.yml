@@ -53,9 +53,10 @@ on:
         default: false
         type: boolean
 
-# 同一事件类型的运行排队执行，不取消进行中的运行
+# 不同平台的运行可并行（并发组按平台拆分）；同一平台排队执行，不取消进行中的运行
+# （Release 发布步骤本身已按 Draft + --clobber 设计为并发安全）
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ inputs.platform }}
   cancel-in-progress: false
 
 permissions:
