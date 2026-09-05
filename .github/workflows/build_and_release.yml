@@ -714,9 +714,12 @@ jobs:
           done
 
           # ---- 依赖闭包：反复收集 mingw 运行时 DLL（多轮迭代直至收敛）----
+          # 注意：grep 无匹配时返回 1，在 set -o pipefail 下会终止脚本，
+          # 因此管道整体用 || true 兜底
           for round in 1 2 3 4 5 6; do
             find "$DIST" -type f \( -name '*.exe' -o -name '*.dll' \) | while read -r f; do
-              ldd "$f" 2>/dev/null | awk '/=> *\//{print $3}' | grep '^/mingw64/bin/' | while read -r dll; do
+              deps="$(ldd "$f" 2>/dev/null | awk '/=> *\//{print $3}' | grep '^/mingw64/bin/' || true)"
+              echo "$deps" | while read -r dll; do
                 [ -f "$dll" ] || continue
                 name="$(basename "$dll")"
                 if [ ! -f "$DIST/bin/$name" ] && [ ! -f "$DIST/lib/${LIB_NAME}/$name" ]; then
