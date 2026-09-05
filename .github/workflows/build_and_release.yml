@@ -400,10 +400,12 @@ jobs:
         run: |
           set -euo pipefail
           cd ardour
-          # Homebrew 的旧 API 版（keg-only）包需显式加入 pkg-config 路径；
-          # boost 检查不走 pkg-config，需通过 CPPFLAGS/LDFLAGS 加入 Homebrew 前缀
+          # Homebrew 里 libarchive/libxml2/curl/gettext 等是 keg-only，旧 API 版
+          # GTK 绑定库（glibmm@2.66 等）也在 /opt 下，用通配把所有 opt 包的
+          # pkgconfig 目录都加入搜索路径；boost 检查不走 pkg-config，
+          # 需通过 CPPFLAGS/LDFLAGS 加入 Homebrew 前缀
           HOMEBREW_PREFIX="$(brew --prefix)"
-          export PKG_CONFIG_PATH="${HOMEBREW_PREFIX}/opt/glibmm@2.66/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/atkmm@2.28/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/pangomm@2.46/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/cairomm@1.14/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/gettext/lib/pkgconfig:${HOMEBREW_PREFIX}/lib/pkgconfig:/usr/lib/pkgconfig"
+          export PKG_CONFIG_PATH="$(echo "${HOMEBREW_PREFIX}"/opt/*/lib/pkgconfig | tr ' ' ':'):${HOMEBREW_PREFIX}/lib/pkgconfig:/usr/lib/pkgconfig"
           export CPPFLAGS="-I${HOMEBREW_PREFIX}/include"
           export LDFLAGS="-L${HOMEBREW_PREFIX}/lib"
           python3 ./waf configure \
@@ -610,15 +612,17 @@ jobs:
           PY="$(command -v python3 || command -v python)"
           NPROC="$(nproc)"
           echo "使用 Python：${PY}"
+          # mingw python 是原生 Windows 程序，--prefix 必须用 Windows 路径
+          PREFIX_WIN="$(cygpath -m "$PWD")/install"
           # 关键：waf 由原生 Windows python 运行，其子进程（gcc/ar/pkg-config
           # 等检测）用 Windows 格式 PATH 搜索。MSYS2 的 POSIX PATH 传给原生
           # 子进程时会丢失 /mingw64/bin 等条目，因此为 waf 显式导出 Windows
           # 格式 PATH（分号分隔），确保能找到 mingw64 的 gcc/ar/pkg-config。
+          # 注意：必须在所有 cygpath 调用之后覆盖 PATH（bash 按冒号解析 PATH，
+          # 覆盖后 bash 自身将无法再解析任何命令）。
           MINGW_BIN="$(cygpath -m /mingw64/bin)"
           MSYS_BIN="$(cygpath -m /usr/bin)"
           export PATH="${MINGW_BIN};${MSYS_BIN};C:\\Windows\\System32;C:\\Windows"
-          # mingw python 是原生 Windows 程序，--prefix 必须用 Windows 路径
-          PREFIX_WIN="$(cygpath -m "$PWD")/install"
           "$PY" ./waf configure \
             --dist-target=mingw \
             --prefix="$PREFIX_WIN" \
