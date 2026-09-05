@@ -1,0 +1,4 @@
+# 工作流与脚本文件强制 LF 行尾（GitHub Actions 的 bash 对 CRLF 敏感）
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf

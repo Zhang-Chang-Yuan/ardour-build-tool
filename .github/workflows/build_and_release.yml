@@ -1,0 +1,762 @@
+# =============================================================================
+# Ardour 自动构建与发布工作流
+#
+# 触发方式：仅手动（workflow_dispatch）。
+#   - 指定版本与平台构建单个组合；
+#   - 勾选 build_all 时自动补齐所有缺失的「版本×平台」组合。
+#
+# 版本范围：仅构建 9.0 及之后的版本。
+#   原因：9.x 是当前稳定系列，本仓库的构建配方（Linux apt 依赖 /
+#   macOS Homebrew 依赖 / Windows MSYS2 依赖）均针对 9.x 验证；
+#   更老的版本第三方库版本差异较大，不在 CI 上尝试。
+#
+# 构建方式（均为 waf 构建，参考 Arch 官方 PKGBUILD 与官方打包脚本）：
+#   - Linux  : ubuntu-latest + apt 依赖，后端 alsa/jack/pulseaudio/dummy，
+#              `./waf install` 后打包为可重定位的 tar.gz（附启动脚本）；
+#   - macOS  : macos-latest (Apple Silicon) + Homebrew 依赖，
+#              后端 coreaudio/dummy，打包为 Ardour.app 并压成 .dmg；
+#   - Windows: MSYS2 MINGW64 (mingw-w64 gcc)，后端 portaudio/jack/dummy，
+#              打包为 zip（自动收集全部依赖 DLL）。
+#
+# 发布策略（并发安全）：
+#   - 目标 Release 为 Draft（草稿，仅仓库所有者可见，便于确认构建结果后再发布）；
+#   - 已存在的草稿不会被删除，产物以 --clobber 方式覆盖上传（始终为最新构建），
+#     因此同一版本的三个平台任务可以安全并发；
+#   - 仅当同名 Release 已被发布为正式版（非草稿）时，先删除再重建为草稿。
+#
+# 本仓库仅包含 CI 脚本与文档，不包含、不分发任何 Ardour 源码或二进制文件。
+# =============================================================================
+
+name: Build and Release Ardour
+
+on:
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      ardour_version:
+        description: 'Ardour 版本 tag（仅 9.0+，如 9.8；留空构建最新稳定版）'
+        required: false
+        default: ''
+        type: string
+      platform:
+        description: '构建平台'
+        required: false
+        type: choice
+        default: 'windows-latest'
+        options:
+          - windows-latest
+          - macos-latest
+          - ubuntu-latest
+      build_all:
+        description: '补齐全部缺失的版本×平台组合'
+        required: false
+        default: false
+        type: boolean
+
+# 同一事件类型的运行排队执行，不取消进行中的运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # 只构建此版本及之后的稳定版（构建配方针对 9.x 验证）
+  MIN_VERSION: 9.0
+  # Ardour 官方源码仓库（GitHub 镜像）
+  ARDOUR_REPO: https://github.com/Ardour/ardour.git
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1：计算要构建的「版本×平台」组合（手动触发时运行）
+  #  - 手动单发（未勾选 build_all）：单个组合，版本取输入（空则由构建步骤解析
+  #    为最新稳定版），平台取输入；
+  #  - 勾选 build_all：对比 Ardour/ardour 官方 tags 与本仓库已有 releases
+  #    （含 draft），输出全部缺失组合。
+  # 输出 JSON 数组：[ {"version":"9.8","platform":"windows-latest"}, ... ]
+  # ---------------------------------------------------------------------------
+  check-and-trigger:
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    outputs:
+      combos: ${{ steps.check.outputs.combos }}
+    steps:
+      - name: 计算构建组合
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          BUILD_ALL: ${{ inputs.build_all }}
+          INPUT_VERSION: ${{ inputs.ardour_version }}
+          INPUT_PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # ---- 仅处理 workflow_dispatch 事件 ----
+          if [ "$EVENT" != "workflow_dispatch" ]; then
+            echo "事件 ${EVENT} 不触发构建"
+            echo "combos=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---- 0. 手动单发模式：直接输出输入的组合 ----
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$BUILD_ALL" != "true" ]; then
+            echo "手动单发模式：version=${INPUT_VERSION:-<latest>} platform=${INPUT_PLATFORM}"
+            combos="[{\"version\":\"${INPUT_VERSION}\",\"platform\":\"${INPUT_PLATFORM}\"}]"
+            echo "combos=${combos}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---- 1. 获取本仓库全部 releases（含 draft），汇总各 tag 已有产物后缀 ----
+          # 平台产物命名：-windows-x64.zip / -macos-arm64.dmg / -linux-x64.tar.gz
+          rel_file="$(mktemp)"
+          page=1
+          while :; do
+            resp=$(curl -sSf \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}")
+            count=$(echo "$resp" | jq -r 'length')
+            if [ "$count" -eq 0 ]; then break; fi
+            echo "$resp" | jq -c '.[] | {tag: .tag_name, assets: [.assets[].name]}' >> "$rel_file"
+            page=$((page + 1))
+          done
+
+          has_asset() {  # has_asset <tag> <suffix>
+            grep -F "\"tag\":\"$1\"" "$rel_file" 2>/dev/null \
+              | jq -r --arg s "$2" '.assets[]? | select(endswith($s))' 2>/dev/null | grep -q .
+          }
+
+          # ---- 2. 获取 Ardour/ardour 官方 tags（分页拉取）----
+          official_tags_file="$(mktemp)"
+          page=1
+          while :; do
+            resp=$(curl -sSf \
+              "https://api.github.com/repos/Ardour/ardour/tags?per_page=100&page=${page}")
+            count=$(echo "$resp" | jq -r 'length')
+            if [ "$count" -eq 0 ]; then break; fi
+            echo "$resp" | jq -r '.[].name' >> "$official_tags_file"
+            page=$((page + 1))
+            if [ "$page" -gt 20 ]; then break; fi   # 安全上限
+          done
+
+          # ---- 3. 过滤：仅保留 X.Y(.Z) 纯数字格式且 >= MIN_VERSION 的稳定 tag ----
+          # Ardour 的 release tag 没有 v 前缀（如 9.8），且存在大量非版本 tag
+          # （BUILD-ID / sae-1 / prercu 等），必须严格过滤
+          stable_file="$(mktemp)"
+          grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' "$official_tags_file" | while read -r tag; do
+            if [ "$(printf '%s\n%s\n' "${MIN_VERSION}" "$tag" | sort -V | head -n 1)" = "${MIN_VERSION}" ]; then
+              echo "$tag"
+            fi
+          done | sort -rV > "$stable_file" || true
+          echo "目标范围内的官方版本（>= ${MIN_VERSION}）："
+          cat "$stable_file" || true
+          echo "本仓库已有 releases："
+          cat "$rel_file" || true
+
+          # ---- 4. 按「版本×平台」计算缺失组合 ----
+          combos_json="["
+          first=1
+          while read -r tag; do
+            [ -z "$tag" ] && continue
+            for plat in windows-latest macos-latest ubuntu-latest; do
+              case "$plat" in
+                windows-latest) suffix="-windows-x64.zip" ;;
+                macos-latest)   suffix="-macos-arm64.dmg" ;;
+                ubuntu-latest)  suffix="-linux-x64.tar.gz" ;;
+              esac
+              if ! has_asset "$tag" "$suffix"; then
+                echo "缺失：${tag} × ${plat}"
+                if [ $first -eq 1 ]; then first=0; else combos_json="${combos_json},"; fi
+                combos_json="${combos_json}{\"version\":\"${tag}\",\"platform\":\"${plat}\"}"
+              fi
+            done
+          done < "$stable_file"
+          combos_json="${combos_json}]"
+
+          echo "combos=${combos_json}" >> "$GITHUB_OUTPUT"
+          echo "最终输出：${combos_json}"
+
+  # ---------------------------------------------------------------------------
+  # Job 2：构建矩阵
+  #  - 手动单发（未勾选 build_all）：单个「版本×平台」组合；
+  #  - 勾选 build_all：全部缺失的「版本×平台」组合。
+  # ---------------------------------------------------------------------------
+  build:
+    needs: check-and-trigger
+    if: >-
+      always() &&
+      needs.check-and-trigger.result == 'success' &&
+      needs.check-and-trigger.outputs.combos != '' &&
+      needs.check-and-trigger.outputs.combos != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check-and-trigger.outputs.combos) }}
+    runs-on: ${{ matrix.platform }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------
+      # 解析要构建的版本号（纯 bash 实现，三平台通用；Ardour 无 GitHub
+      # releases，因此从 tags 中取语义排序最大的稳定版作为「最新版」）
+      # -----------------------------------------------------------------
+      - name: 解析要构建的版本号
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
+            tags_file="$(mktemp)"
+            page=1
+            while :; do
+              curl -sSf "https://api.github.com/repos/Ardour/ardour/tags?per_page=100&page=${page}" \
+                | grep -oE '"name": *"[^"]+"' \
+                | sed -E 's/"name": *"([^"]+)"/\1/' >> "$tags_file" || true
+              total=$(wc -l < "$tags_file")
+              if [ "$page" -gt 1 ] && [ "$((total - prev_total))" -lt 100 ]; then break; fi
+              prev_total=$total
+              page=$((page + 1))
+              if [ "$page" -gt 20 ]; then break; fi   # 安全上限
+            done
+            VERSION=$(grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' "$tags_file" | sort -V | tail -n 1)
+            echo "输入为空/latest，使用官方最新稳定 tag：${VERSION}"
+          fi
+          # 仅支持稳定版本，拒绝 alpha/beta/rc/pre 等预发布 tag
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "不支持的版本格式：${VERSION}（仅支持 X.Y 或 X.Y.Z 的稳定版本，如 9.8）"
+            exit 1
+          fi
+          # 仅支持 MIN_VERSION 及以上
+          if [ "$(printf '%s\n%s\n' "${MIN_VERSION}" "$VERSION" | sort -V | head -n 1)" != "${MIN_VERSION}" ]; then
+            echo "不支持的版本：${VERSION}（本仓库仅构建 ${MIN_VERSION} 及以上版本，原因见 README）"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "最终构建版本：${VERSION}"
+
+      # =====================================================================
+      # Linux（ubuntu-latest）：apt 依赖 + waf 构建 + 可重定位 tar.gz
+      # =====================================================================
+      - name: 安装依赖 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git python3 pkg-config gettext \
+            libboost-dev \
+            libglib2.0-dev libglibmm-2.4-dev \
+            libatk1.0-dev libatkmm-1.6-dev \
+            libpango1.0-dev libpangomm-1.4-dev \
+            libcairo2-dev libcairomm-1.0-dev \
+            libgdk-pixbuf-2.0-dev \
+            libfontconfig1-dev libfreetype6-dev libharfbuzz-dev \
+            libx11-dev libxext-dev \
+            libsndfile1-dev libflac-dev libogg-dev libsamplerate0-dev \
+            libcurl4-openssl-dev libarchive-dev liblo-dev libtag1-dev \
+            libvamp-plugin-sdk-dev librubberband-dev \
+            libasound2-dev libjack-jackd2-dev libpulse-dev \
+            libusb-1.0-0-dev libhidapi-dev libdbus-1-dev \
+            libwebsockets-dev libxml2-dev \
+            liblilv-dev libserd-dev libsord-dev libsratom-dev lv2-dev \
+            liblrdf0-dev libaubio-dev libfftw3-dev libfluidsynth-dev \
+            libpng-dev libreadline-dev libcppunit-dev
+
+      - name: 克隆 Ardour 源码 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          git clone --recursive --branch "${{ steps.resolve.outputs.version }}" --depth 1 \
+            "$ARDOUR_REPO" ardour
+
+      - name: 配置与编译 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cd ardour
+          python3 ./waf configure \
+            --prefix=/usr \
+            --cxx17 \
+            --no-phone-home \
+            --optimize \
+            --ptformat \
+            --with-backends=alsa,jack,pulseaudio,dummy
+          python3 ./waf -j"$(nproc)"
+
+      - name: 安装与打包 (Linux)
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd ardour
+          python3 ./waf install --destdir="$PWD/stage"
+
+          MAJOR="${VERSION%%.*}"
+          LIB_NAME="ardour${MAJOR}"
+          BUNDLE="Ardour-${VERSION}-Linux-x64"
+          mkdir -p "$BUNDLE/bin" "$BUNDLE/lib" "$BUNDLE/share" "$BUNDLE/etc"
+
+          # 二进制：stage/usr/bin/ardour9（用 find 兜底以防布局差异）
+          main_bin="$(find stage -type f -name 'ardour[0-9]*' -path '*/bin/*' | head -n 1)"
+          if [ -z "$main_bin" ]; then
+            echo "未找到主程序，stage 布局如下："
+            find stage -maxdepth 3 -type d || true
+            exit 1
+          fi
+          cp -a "$main_bin" "$BUNDLE/bin/${LIB_NAME}"
+
+          # 私有库：usr/lib/ardour9/（libardour.so、后端、控制面、LV2 等）
+          privlib="$(find stage -type d -name "${LIB_NAME}" -path '*/lib/*' | head -n 1)"
+          if [ -z "$privlib" ]; then
+            echo "未找到私有库目录 ${LIB_NAME}"
+            exit 1
+          fi
+          cp -a "$privlib" "$BUNDLE/lib/"
+
+          # 共享数据：usr/share/ardour9/（模板、主题、脚本、字体、MIDI 映射等）
+          shareddir="$(find stage -type d -name "${LIB_NAME}" -path '*/share/*' | head -n 1)"
+          if [ -z "$shareddir" ]; then
+            echo "未找到共享数据目录 ${LIB_NAME}"
+            exit 1
+          fi
+          cp -a "$shareddir" "$BUNDLE/share/"
+
+          # 系统配置：etc/ardour9/（SYSCONFDIR 可能在 /etc 或 /usr/etc，都查找）
+          etcdir="$(find stage -type d -name "${LIB_NAME}" -path '*/etc/*' | head -n 1)"
+          if [ -n "$etcdir" ]; then
+            cp -a "$etcdir" "$BUNDLE/etc/"
+          fi
+
+          # ---- 启动脚本：设置重定位环境变量并执行真实二进制 ----
+          cat > "$BUNDLE/${LIB_NAME}" << 'LAUNCHER_EOF'
+          #!/bin/sh
+          # Ardour (Auto Build) 启动脚本 —— 可在任意目录解压后运行
+          INSTALL_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+          LIB_NAME="__LIB_NAME__"
+          export ARDOUR_BUNDLED=true
+          export LD_LIBRARY_PATH="$INSTALL_DIR/lib/$LIB_NAME${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export ARDOUR_DATA_PATH="$INSTALL_DIR/share/$LIB_NAME"
+          export ARDOUR_CONFIG_PATH="$INSTALL_DIR/etc/$LIB_NAME"
+          export ARDOUR_DLL_PATH="$INSTALL_DIR/lib/$LIB_NAME"
+          for sub in backends surfaces panners ctrl-interface; do
+            if [ -d "$INSTALL_DIR/lib/$LIB_NAME/$sub" ]; then
+              export ARDOUR_DLL_PATH="$ARDOUR_DLL_PATH:$INSTALL_DIR/lib/$LIB_NAME/$sub"
+            fi
+          done
+          export VAMP_PATH="$INSTALL_DIR/lib/$LIB_NAME"
+          exec "$INSTALL_DIR/bin/$LIB_NAME" "$@"
+          LAUNCHER_EOF
+          sed -i "s/__LIB_NAME__/${LIB_NAME}/" "$BUNDLE/${LIB_NAME}"
+          chmod +x "$BUNDLE/${LIB_NAME}"
+
+          ARTIFACT="ardour-${VERSION}-linux-x64.tar.gz"
+          tar -czf "$ARTIFACT" "$BUNDLE"
+          echo "产物：${ARTIFACT}"
+          echo "artifact_name=${ARTIFACT}" >> "$GITHUB_ENV"
+
+      # =====================================================================
+      # macOS（macos-latest，Apple Silicon）：Homebrew 依赖 + Ardour.app + dmg
+      # =====================================================================
+      - name: 安装依赖 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew update
+          brew install \
+            pkg-config python3 boost \
+            glib glibmm@2.66 \
+            atk atkmm@2.28 \
+            pango pangomm@2.46 \
+            cairo cairomm@1.14 \
+            gdk-pixbuf fontconfig freetype harfbuzz gettext \
+            libsndfile flac libogg libsamplerate \
+            curl libarchive liblo taglib \
+            vamp-plugin-sdk rubberband \
+            libusb hidapi dbus \
+            libwebsockets libxml2 \
+            lilv serd sord sratom lv2 lrdf \
+            aubio fftw fluidsynth \
+            libpng readline cppunit
+
+      - name: 克隆 Ardour 源码 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          git clone --recursive --branch "${{ steps.resolve.outputs.version }}" --depth 1 \
+            "$ARDOUR_REPO" ardour
+
+      - name: 配置与编译 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          cd ardour
+          # Homebrew 的旧 API 版（keg-only）包需显式加入 pkg-config 路径
+          HOMEBREW_PREFIX="$(brew --prefix)"
+          export PKG_CONFIG_PATH="${HOMEBREW_PREFIX}/opt/glibmm@2.66/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/atkmm@2.28/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/pangomm@2.46/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/cairomm@1.14/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/gettext/lib/pkgconfig:${HOMEBREW_PREFIX}/lib/pkgconfig:/usr/lib/pkgconfig"
+          python3 ./waf configure \
+            --prefix="$PWD/install" \
+            --cxx17 \
+            --no-phone-home \
+            --optimize \
+            --ptformat \
+            --with-backends=coreaudio,dummy
+          python3 ./waf -j"$(sysctl -n hw.logicalcpu)"
+          python3 ./waf install
+
+      - name: 打包 Ardour.app (macOS)
+        if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd ardour
+
+          MAJOR="${VERSION%%.*}"
+          APP_NAME="Ardour${MAJOR}"
+          LIB_NAME="ardour${MAJOR}"
+          INSTALL="$PWD/install"
+          APPDIR="${APP_NAME}.app"
+          CONTENTS="$APPDIR/Contents"
+          LIBD="$CONTENTS/lib"
+          RESD="$CONTENTS/Resources"
+
+          mkdir -p "$CONTENTS/MacOS" "$LIBD" "$RESD"
+
+          # ---- 诊断：主程序的外部引用方式（@loader_path / 绝对路径 / rpath）----
+          echo "=== install/bin 主程序引用 ==="
+          otool -L "$INSTALL/bin/${LIB_NAME}" 2>/dev/null | head -n 12 || true
+          echo "=== 主程序 LC_RPATH ==="
+          otool -l "$INSTALL/bin/${LIB_NAME}" 2>/dev/null | grep -A2 LC_RPATH | head -n 12 || true
+
+          # ---- 主程序与辅助程序（vst/au scanner 等）----
+          for f in "$INSTALL"/bin/*; do
+            [ -f "$f" ] || continue
+            name="$(basename "$f")"
+            if [ "$name" = "${LIB_NAME}" ]; then
+              cp -a "$f" "$CONTENTS/MacOS/${APP_NAME}"
+            else
+              cp -a "$f" "$LIBD/" || true
+            fi
+          done
+          if [ ! -f "$CONTENTS/MacOS/${APP_NAME}" ]; then
+            echo "未找到主程序 ${LIB_NAME}，install/bin 内容如下："
+            ls "$INSTALL/bin" || true
+            exit 1
+          fi
+          chmod +x "$CONTENTS/MacOS/"*
+
+          # ---- 私有库（libardour.dylib、后端、控制面、LV2 等）----
+          # 完整保留安装树的内部相对结构（lib/ardour9/ 及其子目录），
+          # 因为 waf 在 darwin 上按安装布局重写了内部 dylib 的 @loader_path 引用
+          privlib="$(find "$INSTALL" -type d -name "${LIB_NAME}" -path '*/lib/*' | head -n 1)"
+          if [ -z "$privlib" ]; then
+            echo "未找到私有库目录 ${LIB_NAME}"
+            exit 1
+          fi
+          cp -a "$privlib" "$LIBD/"
+          # clearlooks 主题引擎（官方 bundle 同款，双路径兼容）
+          engine="$PWD/build/libs/clearlooks-newer/libclearlooks.dylib"
+          if [ -f "$engine" ]; then
+            mkdir -p "$LIBD/gtkengines/engines" "$LIBD/gtk-2.0/2.10.0/engines"
+            cp "$engine" "$LIBD/gtkengines/engines/libclearlooks.so"
+            cp "$engine" "$LIBD/gtk-2.0/2.10.0/engines/libclearlooks.so"
+          fi
+
+          # ---- 共享数据 + 系统配置（官方 bundle：Etc = Resources）----
+          shareddir="$(find "$INSTALL" -type d -name "${LIB_NAME}" -path '*/share/*' | head -n 1)"
+          if [ -z "$shareddir" ]; then
+            echo "未找到共享数据目录 ${LIB_NAME}"
+            exit 1
+          fi
+          cp -a "$shareddir/." "$RESD/"
+          etcdir="$(find "$INSTALL" -type d -name "${LIB_NAME}" -path '*/etc/*' | head -n 1)"
+          if [ -n "$etcdir" ]; then
+            cp -a "$etcdir/." "$RESD/"
+          fi
+
+          # ---- 图标与字体配置 ----
+          cp tools/osx_packaging/Ardour.icns "$RESD/appIcon.icns"
+          cp tools/osx_packaging/typeArdour.icns "$RESD/" 2>/dev/null || true
+          cp tools/osx_packaging/Resources/fonts.conf "$RESD/fonts.conf" 2>/dev/null || true
+
+          # ---- Info.plist（复用源码模板，注入 LSEnvironment）----
+          env_plist="<key>LSEnvironment</key><dict>"
+          env_plist="${env_plist}<key>ARDOUR_BUNDLED</key><string>true</string>"
+          env_plist="${env_plist}<key>PATH</key><string>/usr/local/bin:/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>"
+          env_plist="${env_plist}<key>DYLIB_FALLBACK_LIBRARY_PATH</key><string>/usr/local/lib:/opt/lib</string>"
+          env_plist="${env_plist}</dict>"
+          sed -e "s?@ENV@?${env_plist}?g" \
+              -e "s?@VERSION@?${VERSION}?g" \
+              -e "s?@INFOSTRING@?Ardour ${VERSION} (Auto Build)?g" \
+              -e "s?@IDBASE@?com.ardour-build-tool?g" \
+              -e "s?@IDSUFFIX@?${APP_NAME}?g" \
+              -e "s?@BUNDLENAME@?${APP_NAME}?g" \
+              -e "s?@EXECUTABLE@?${APP_NAME}?g" \
+              < tools/osx_packaging/Info.plist.in > "$CONTENTS/Info.plist"
+
+          # ---- 依赖闭包：把 Homebrew 等外部 dylib 收进 bundle 并改写引用 ----
+          sys_filter='/usr/lib/|^/System/|^@'
+          changed=1; iter=0
+          while [ "$changed" -eq 1 ] && [ "$iter" -lt 8 ]; do
+            changed=0; iter=$((iter + 1))
+            while IFS= read -r file; do
+              deps=$(otool -L "$file" 2>/dev/null | awk 'NR>1{print $1}' | grep -vE "$sys_filter" || true)
+              for d in $deps; do
+                [ -f "$d" ] || continue
+                name="$(basename "$d")"
+                if [ ! -f "$LIBD/$name" ]; then
+                  cp -f "$d" "$LIBD/"
+                  changed=1
+                fi
+                install_name_tool -change "$d" "@executable_path/../lib/$name" "$file" 2>/dev/null || true
+              done
+            done < <(find "$CONTENTS/MacOS" "$LIBD" -type f \( -name '*.dylib' -o -perm -u+x \) 2>/dev/null || true)
+          done
+          echo "bundle lib/ 文件数：$(ls "$LIBD" | wc -l)"
+
+          # ---- ad-hoc 签名（否则 Gatekeeper 拒绝运行）----
+          codesign --force --deep --sign - "$APPDIR" 2>/dev/null || \
+            codesign --force --sign - "$APPDIR" || true
+
+          # ---- dmg ----
+          ARTIFACT="ardour-${VERSION}-macos-arm64.dmg"
+          hdiutil create -volname "Ardour ${VERSION}" -srcfolder "$APPDIR" \
+            -ov -format UDZO "$ARTIFACT"
+          echo "产物：${ARTIFACT}"
+          echo "artifact_name=${ARTIFACT}" >> "$GITHUB_ENV"
+
+      # =====================================================================
+      # Windows（windows-latest）：MSYS2 MINGW64 + waf 构建 + DLL 收集 zip
+      # =====================================================================
+      - name: 安装 MSYS2 与依赖 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2-actions/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          release: false
+          install: >-
+            git unzip make zip
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-boost
+            mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-glibmm
+            mingw-w64-x86_64-atk
+            mingw-w64-x86_64-atkmm
+            mingw-w64-x86_64-pango
+            mingw-w64-x86_64-pangomm
+            mingw-w64-x86_64-cairo
+            mingw-w64-x86_64-cairomm
+            mingw-w64-x86_64-gdk-pixbuf2
+            mingw-w64-x86_64-fontconfig
+            mingw-w64-x86_64-freetype
+            mingw-w64-x86_64-harfbuzz
+            mingw-w64-x86_64-gettext
+            mingw-w64-x86_64-libsndfile
+            mingw-w64-x86_64-flac
+            mingw-w64-x86_64-libogg
+            mingw-w64-x86_64-libsamplerate
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-libarchive
+            mingw-w64-x86_64-liblo
+            mingw-w64-x86_64-taglib
+            mingw-w64-x86_64-vamp-plugin-sdk
+            mingw-w64-x86_64-rubberband
+            mingw-w64-x86_64-aubio
+            mingw-w64-x86_64-fftw
+            mingw-w64-x86_64-jack2
+            mingw-w64-x86_64-portaudio
+            mingw-w64-x86_64-libusb
+            mingw-w64-x86_64-hidapi
+            mingw-w64-x86_64-libwebsockets
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-serd
+            mingw-w64-x86_64-sord
+            mingw-w64-x86_64-sratom
+            mingw-w64-x86_64-lilv
+            mingw-w64-x86_64-drmingw
+            mingw-w64-x86_64-libpng
+
+      - name: 克隆 Ardour 源码 (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          git clone --recursive --branch "${{ steps.resolve.outputs.version }}" --depth 1 \
+            -c core.longpaths=true \
+            "$ARDOUR_REPO" ardour
+
+      - name: 配置与编译 (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd ardour
+          PY="$(command -v python3 || command -v python)"
+          echo "使用 Python：${PY}"
+          # mingw python 是原生 Windows 程序，--prefix 必须用 Windows 路径
+          PREFIX_WIN="$(cygpath -m "$PWD")/install"
+          "$PY" ./waf configure \
+            --dist-target=mingw \
+            --prefix="$PREFIX_WIN" \
+            --cxx17 \
+            --no-phone-home \
+            --optimize \
+            --ptformat \
+            --with-backends=portaudio,jack,dummy
+          "$PY" ./waf -j"$(nproc)"
+          "$PY" ./waf install
+
+      - name: 打包 (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd ardour
+
+          MAJOR="${VERSION%%.*}"
+          APP_NAME="Ardour${MAJOR}"
+          LIB_NAME="ardour${MAJOR}"
+          DIST="${APP_NAME}-Windows"
+          INST_UX="$PWD/install"
+          mkdir -p "$DIST/bin" "$DIST/lib" "$DIST/share"
+
+          # ---- 安装树拷贝（bin/、lib/ardour9/、share/ardour9/、etc/）----
+          if [ ! -f "$INST_UX/bin/${LIB_NAME}.exe" ]; then
+            echo "未找到主程序 ${LIB_NAME}.exe，install/bin 内容如下："
+            ls "$INST_UX/bin" || true
+            exit 1
+          fi
+          cp -a "$INST_UX/bin/." "$DIST/bin/"
+          cp -a "$INST_UX/lib/${LIB_NAME}" "$DIST/lib/"
+          shareddir="$(find "$INST_UX" -type d -name "${LIB_NAME}" -path '*/share/*' | head -n 1)"
+          if [ -z "$shareddir" ]; then
+            echo "未找到共享数据目录 ${LIB_NAME}"
+            exit 1
+          fi
+          cp -a "$shareddir" "$DIST/share/"
+          etcdir="$(find "$INST_UX" -type d -name "${LIB_NAME}" -path '*/etc/*' | head -n 1)"
+          if [ -n "$etcdir" ]; then
+            mkdir -p "$DIST/etc"
+            cp -a "$etcdir" "$DIST/etc/"
+          fi
+
+          # ---- 插件目录（ladspa/lv2/vamp，来自 MSYS2，可选）----
+          for d in ladspa lv2 vamp; do
+            [ -d "/mingw64/lib/$d" ] && cp -a "/mingw64/lib/$d" "$DIST/lib/" || true
+          done
+
+          # ---- 依赖闭包：反复收集 mingw 运行时 DLL（多轮迭代直至收敛）----
+          for round in 1 2 3 4 5 6; do
+            find "$DIST" -type f \( -name '*.exe' -o -name '*.dll' \) | while read -r f; do
+              ldd "$f" 2>/dev/null | awk '/=> *\//{print $3}' | grep '^/mingw64/bin/' | while read -r dll; do
+                [ -f "$dll" ] || continue
+                name="$(basename "$dll")"
+                if [ ! -f "$DIST/bin/$name" ] && [ ! -f "$DIST/lib/${LIB_NAME}/$name" ]; then
+                  cp "$dll" "$DIST/bin/"
+                  echo "收集依赖 DLL：$name（第 $round 轮）"
+                fi
+              done
+            done
+          done
+
+          # ---- 启动脚本（设置重定位环境变量，脱离 MSYS2 也能运行）----
+          cat > "$DIST/${APP_NAME}.cmd" << 'LAUNCHER_EOF'
+          @echo off
+          rem Ardour (Auto Build) 启动脚本
+          setlocal
+          set MAJOR=__MAJOR__
+          set ARDOUR_DATA_PATH=%~dp0share\ardour%MAJOR%
+          set ARDOUR_CONFIG_PATH=%~dp0etc\ardour%MAJOR%
+          set ARDOUR_DLL_PATH=%~dp0bin;%~dp0lib\ardour%MAJOR%;%~dp0lib\ardour%MAJOR%\backends;%~dp0lib\ardour%MAJOR%\surfaces;%~dp0lib\ardour%MAJOR%\panners
+          set VAMP_PATH=%~dp0lib\vamp
+          start "" "%~dp0bin\ardour%MAJOR%.exe" %*
+          endlocal
+          LAUNCHER_EOF
+          sed -i "s/__MAJOR__/${MAJOR}/" "$DIST/${APP_NAME}.cmd"
+          # 转为 CRLF，兼容 cmd.exe
+          sed -i 's/$/\r/' "$DIST/${APP_NAME}.cmd"
+
+          # ---- zip ----
+          ARTIFACT="ardour-${VERSION}-windows-x64.zip"
+          rm -f "$ARTIFACT"
+          if command -v 7z > /dev/null 2>&1; then
+            7z a -tzip "$ARTIFACT" "./$(basename "$DIST")" > /dev/null
+          else
+            zip -qr "$ARTIFACT" "$(basename "$DIST")"
+          fi
+          echo "产物：${ARTIFACT}"
+          echo "artifact_name=${ARTIFACT}" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------
+      # 上传构建产物（Artifact 备份）
+      # -----------------------------------------------------------------
+      - name: 上传构建产物（Artifact 备份）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.artifact_name }}
+          path: ardour/${{ env.artifact_name }}
+          if-no-files-found: error
+
+      # -----------------------------------------------------------------
+      # 发布 Draft Release（并发安全）
+      #  - 已存在的草稿不删除，产物用 --clobber 覆盖上传（始终为最新构建）；
+      #  - 同一版本的三个平台任务并发运行时互不干扰；
+      #  - 仅当同名 Release 已被发布为正式版时，先删除（含 tag）再重建为草稿。
+      # -----------------------------------------------------------------
+      - name: 发布 Draft Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          ARTIFACT: ${{ env.artifact_name }}
+        run: |
+          set -euo pipefail
+          # 若同名 release 已存在且为正式发布（非草稿），先删除再重建为草稿
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft >/dev/null 2>&1; then
+            is_draft=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)
+            if [ "$is_draft" != "true" ]; then
+              echo "已存在正式 release：${VERSION}，删除后重建为草稿"
+              gh release delete "$VERSION" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || {
+                echo "gh release delete 失败，尝试手动删除 tag"
+                git push --delete "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION" || true
+              }
+            fi
+          fi
+          # 若草稿不存在则创建（并发下可能已被兄弟任务创建，失败可容忍）
+          if ! gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Ardour ${VERSION} (Auto Build)" \
+              --draft \
+              --notes "自动构建于 $(date -u)" \
+              || echo "release ${VERSION} 创建失败（可能已被并行任务创建），继续上传"
+          fi
+          # 等待 release 可见（API 最终一致性）
+          for i in $(seq 1 12); do
+            gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && break
+            sleep 5
+          done
+          # 上传产物（--clobber 覆盖同名旧产物；带重试，缓解瞬时 403/限流）
+          for attempt in 1 2 3; do
+            if gh release upload "$VERSION" "ardour/${ARTIFACT}" \
+                 --repo "$GITHUB_REPOSITORY" --clobber; then
+              echo "已上传产物到 Draft Release：${VERSION}（${ARTIFACT}）"
+              exit 0
+            fi
+            echo "上传失败（第 ${attempt} 次），10 秒后重试"
+            sleep 10
+          done
+          echo "产物上传最终失败：${ARTIFACT}"
+          exit 1
