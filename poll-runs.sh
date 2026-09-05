@@ -5,7 +5,7 @@ get() {
   curl -sS -H "Authorization: Bearer $TOKEN" \
     "https://api.github.com/repos/Zhang-Chang-Yuan/ardour-build-tool/actions/runs?per_page=4"
 }
-for i in $(seq 1 60); do
+for i in $(seq 1 70); do
   sleep 150
   summary=$(get | uv run python -c "
 import json, sys

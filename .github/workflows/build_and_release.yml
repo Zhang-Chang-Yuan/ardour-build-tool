@@ -317,14 +317,16 @@ jobs:
           fi
           cp -a "$privlib" "$BUNDLE/lib/"
           # 真实主程序移动到 bundle 的 bin/（ARDOUR_BUNDLED 按 exe 相对路径推导
-          # share/lib/etc，官方 bundle 即为 <bundle>/bin/ardour-x.y 布局）
-          if [ ! -f "$BUNDLE/lib/${LIB_NAME}/${REAL_EXE}" ]; then
-            echo "未找到真实主程序 ${BUNDLE}/lib/${LIB_NAME}/${REAL_EXE}"
-            ls "$BUNDLE/lib/${LIB_NAME}" | head -20 || true
+          # share/lib/etc，官方 bundle 即为 <bundle>/bin/ardour-x.y 布局）。
+          # 名称带完整版本号（如 ardour-9.8.0），用 glob 探测
+          REAL_EXE_FILE="$(find "$BUNDLE/lib/${LIB_NAME}" -maxdepth 1 -type f -name 'ardour-[0-9]*' | head -n 1)"
+          if [ -z "$REAL_EXE_FILE" ]; then
+            echo "未在 ${BUNDLE}/lib/${LIB_NAME} 中找到真实主程序（ardour-<版本号>）"
+            ls "$BUNDLE/lib/${LIB_NAME}" | head -30 || true
             exit 1
           fi
-          mv "$BUNDLE/lib/${LIB_NAME}/${REAL_EXE}" "$BUNDLE/bin/${REAL_EXE}"
-          chmod +x "$BUNDLE/bin/${REAL_EXE}"
+          mv "$REAL_EXE_FILE" "$BUNDLE/bin/ardour-${VERSION}"
+          chmod +x "$BUNDLE/bin/ardour-${VERSION}"
 
           # 共享数据：usr/share/ardour9/（模板、主题、脚本、字体、MIDI 映射等）
           shareddir="$(find stage -type d -name "${LIB_NAME}" -path '*/share/*' | head -n 1)"
@@ -453,26 +455,35 @@ jobs:
 
           mkdir -p "$CONTENTS/MacOS" "$LIBD" "$RESD"
 
-          # ---- 私有库（真实主程序 ardour-9.8、libardour.dylib、后端、控制面、
-          # LV2 等）。注意：install/bin/ardour9 只是 shell 包装脚本（内含编译期
-          # 绝对路径），不可用；真实 GUI 主程序安装在 lib/ardour9/ 下 ----
-          privlib="$(find "$INSTALL" -type d -name "${LIB_NAME}" -path '*/lib/*' | head -n 1)"
-          if [ -z "$privlib" ]; then
-            echo "未找到私有库目录 ${LIB_NAME}，install 布局如下："
-            find "$INSTALL" -maxdepth 3 -type d || true
+          # ---- 私有库与真实主程序。注意：install/bin/ardour9 只是 shell 包装
+          # 脚本（内含编译期绝对路径），不可用；真实 GUI 主程序是安装树中的
+          # Mach-O 可执行文件（命名随平台为 ardour9 或 ardour-9.8.0），内部
+          # 库为 *.dylib（darwin 上也可能全部静态链接，此时无需额外处理）----
+          echo "=== install 树结构（前 60 项）==="
+          find "$INSTALL" -maxdepth 3 | sort | head -60 || true
+          main_exe=""
+          for pat in 'ardour9' 'ardour-9.*'; do
+            cand="$(find "$INSTALL" -type f -name "$pat" | head -n 1)"
+            if [ -n "$cand" ] && file "$cand" | grep -q 'Mach-O.*executable'; then
+              main_exe="$cand"
+              break
+            fi
+          done
+          if [ -z "$main_exe" ]; then
+            echo "未在 install 树中找到 Mach-O 主程序"
             exit 1
           fi
-          cp -a "$privlib" "$LIBD/"
-          if [ ! -f "$LIBD/ardour-${VERSION}" ]; then
-            echo "未找到真实主程序 ${LIBD}/ardour-${VERSION}"
-            ls "$LIBD" | head -30 || true
-            exit 1
-          fi
-          cp -a "$LIBD/ardour-${VERSION}" "$CONTENTS/MacOS/${APP_NAME}"
-          rm -f "$LIBD/ardour-${VERSION}"
+          echo "真实主程序：${main_exe}"
+          cp -a "$main_exe" "$CONTENTS/MacOS/${APP_NAME}"
           chmod +x "$CONTENTS/MacOS/${APP_NAME}"
 
-          # ---- 诊断：主程序的外部引用方式（@loader_path / 绝对路径 / rpath）----
+          # 内部 dylib 全部平铺进 Contents/lib（otool 闭包会把引用统一改写为
+          # @executable_path/../lib/<name>）
+          find "$INSTALL" -type f -name '*.dylib' | while read -r f; do
+            cp -f "$f" "$LIBD/"
+          done
+
+          # 诊断：主程序的外部引用方式（@loader_path / 绝对路径 / rpath）
           echo "=== 主程序引用（打包前 12 行）==="
           otool -L "$CONTENTS/MacOS/${APP_NAME}" 2>/dev/null | head -n 12 || true
           # clearlooks 主题引擎（官方 bundle 同款，双路径兼容）
@@ -670,19 +681,20 @@ jobs:
           mkdir -p "$DIST/bin" "$DIST/lib" "$DIST/share"
 
           # ---- 安装树拷贝（bin/ 工具、lib/ardour9/ 内部库、share/、etc/）----
-          # 真实主程序是 install/lib/ardour9/ardour-9.8.exe（bin/ardour9 只是
-          # shell 包装脚本，含编译期绝对路径），移动到 DIST/bin/（exe 按自身
-          # 位置推导 ../share、../lib，与官方 Windows 安装布局一致）
-          if [ ! -f "$INST_UX/lib/${LIB_NAME}/ardour-${VERSION}.exe" ]; then
-            echo "未找到真实主程序 ${INST_UX}/lib/${LIB_NAME}/ardour-${VERSION}.exe"
-            ls "$INST_UX/lib/${LIB_NAME}" 2>/dev/null | head -20 || true
-            ls "$INST_UX/bin" 2>/dev/null | head -10 || true
+          # 真实主程序是 install/lib/ardour9/ 下的 ardour-<完整版本号>.exe
+          # （如 ardour-9.8.0.exe；bin/ardour9 只是 shell 包装脚本，含编译期
+          # 绝对路径），移动到 DIST/bin/ardour9.exe（exe 按自身位置推导
+          # ../share、../lib，与官方 Windows 安装布局一致）
+          REAL_EXE_FILE="$(find "$INST_UX/lib/${LIB_NAME}" -maxdepth 1 -type f -name 'ardour-*.exe' | head -n 1)"
+          if [ -z "$REAL_EXE_FILE" ]; then
+            echo "未在 ${INST_UX}/lib/${LIB_NAME} 中找到真实主程序（ardour-<版本号>.exe）"
+            ls "$INST_UX/lib/${LIB_NAME}" 2>/dev/null | head -30 || true
             exit 1
           fi
           cp -a "$INST_UX/bin/." "$DIST/bin/"
           rm -f "$DIST/bin/${LIB_NAME}"
           cp -a "$INST_UX/lib/${LIB_NAME}" "$DIST/lib/"
-          mv "$DIST/lib/${LIB_NAME}/ardour-${VERSION}.exe" "$DIST/bin/${LIB_NAME}.exe"
+          mv "$REAL_EXE_FILE" "$DIST/bin/${LIB_NAME}.exe"
           cp -a "$INST_UX/lib/${LIB_NAME}" "$DIST/lib/"
           shareddir="$(find "$INST_UX" -type d -name "${LIB_NAME}" -path '*/share/*' | head -n 1)"
           if [ -z "$shareddir" ]; then
