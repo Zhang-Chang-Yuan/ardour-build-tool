@@ -677,12 +677,23 @@ jobs:
           mkdir -p "$DIST/bin" "$DIST/lib" "$DIST/share"
 
           # ---- 安装树拷贝（bin/、lib/ardour9/、share/ardour9/、etc/）----
-          if [ ! -f "$INST_UX/bin/${LIB_NAME}.exe" ]; then
-            echo "未找到主程序 ${LIB_NAME}.exe，install/bin 内容如下："
+          # waf 在 mingw 下把主程序安装为无扩展名的 ardour9，统一重命名为 .exe
+          if [ -f "$INST_UX/bin/${LIB_NAME}.exe" ]; then
+            : # 已是 .exe
+          elif [ -f "$INST_UX/bin/${LIB_NAME}" ]; then
+            if [ "$(head -c 2 "$INST_UX/bin/${LIB_NAME}" 2>/dev/null)" != "MZ" ]; then
+              echo "install/bin/${LIB_NAME} 不是 PE 可执行文件（缺少 MZ 头）"
+              exit 1
+            fi
+          else
+            echo "未找到主程序 ${LIB_NAME}[.exe]，install/bin 内容如下："
             ls "$INST_UX/bin" || true
             exit 1
           fi
           cp -a "$INST_UX/bin/." "$DIST/bin/"
+          if [ -f "$DIST/bin/${LIB_NAME}" ] && [ ! -f "$DIST/bin/${LIB_NAME}.exe" ]; then
+            mv "$DIST/bin/${LIB_NAME}" "$DIST/bin/${LIB_NAME}.exe"
+          fi
           cp -a "$INST_UX/lib/${LIB_NAME}" "$DIST/lib/"
           shareddir="$(find "$INST_UX" -type d -name "${LIB_NAME}" -path '*/share/*' | head -n 1)"
           if [ -z "$shareddir" ]; then
