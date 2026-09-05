@@ -303,25 +303,28 @@ jobs:
 
           MAJOR="${VERSION%%.*}"
           LIB_NAME="ardour${MAJOR}"
+          REAL_EXE="ardour-${VERSION}"
           BUNDLE="Ardour-${VERSION}-Linux-x64"
           mkdir -p "$BUNDLE/bin" "$BUNDLE/lib" "$BUNDLE/share" "$BUNDLE/etc"
 
-          # 二进制：stage/usr/bin/ardour9（用 find 兜底以防布局差异）
-          main_bin="$(find stage -type f -name 'ardour[0-9]*' -path '*/bin/*' | head -n 1)"
-          if [ -z "$main_bin" ]; then
-            echo "未找到主程序，stage 布局如下："
-            find stage -maxdepth 3 -type d || true
-            exit 1
-          fi
-          cp -a "$main_bin" "$BUNDLE/bin/${LIB_NAME}"
-
-          # 私有库：usr/lib/ardour9/（libardour.so、后端、控制面、LV2 等）
+          # 私有库：usr/lib/ardour9/（真实主程序 ardour-9.8、libardour.so、
+          # 后端、控制面、LV2 等；bin/ardour9 只是 shell 包装脚本，不打包）
           privlib="$(find stage -type d -name "${LIB_NAME}" -path '*/lib/*' | head -n 1)"
           if [ -z "$privlib" ]; then
-            echo "未找到私有库目录 ${LIB_NAME}"
+            echo "未找到私有库目录 ${LIB_NAME}，stage 布局如下："
+            find stage -maxdepth 4 -type d || true
             exit 1
           fi
           cp -a "$privlib" "$BUNDLE/lib/"
+          # 真实主程序移动到 bundle 的 bin/（ARDOUR_BUNDLED 按 exe 相对路径推导
+          # share/lib/etc，官方 bundle 即为 <bundle>/bin/ardour-x.y 布局）
+          if [ ! -f "$BUNDLE/lib/${LIB_NAME}/${REAL_EXE}" ]; then
+            echo "未找到真实主程序 ${BUNDLE}/lib/${LIB_NAME}/${REAL_EXE}"
+            ls "$BUNDLE/lib/${LIB_NAME}" | head -20 || true
+            exit 1
+          fi
+          mv "$BUNDLE/lib/${LIB_NAME}/${REAL_EXE}" "$BUNDLE/bin/${REAL_EXE}"
+          chmod +x "$BUNDLE/bin/${REAL_EXE}"
 
           # 共享数据：usr/share/ardour9/（模板、主题、脚本、字体、MIDI 映射等）
           shareddir="$(find stage -type d -name "${LIB_NAME}" -path '*/share/*' | head -n 1)"
@@ -342,21 +345,21 @@ jobs:
           #!/bin/sh
           # Ardour (Auto Build) 启动脚本 —— 可在任意目录解压后运行
           INSTALL_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-          LIB_NAME="__LIB_NAME__"
+          REAL_EXE="__REAL_EXE__"
           export ARDOUR_BUNDLED=true
-          export LD_LIBRARY_PATH="$INSTALL_DIR/lib/$LIB_NAME${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export ARDOUR_DATA_PATH="$INSTALL_DIR/share/$LIB_NAME"
-          export ARDOUR_CONFIG_PATH="$INSTALL_DIR/etc/$LIB_NAME"
-          export ARDOUR_DLL_PATH="$INSTALL_DIR/lib/$LIB_NAME"
+          export LD_LIBRARY_PATH="$INSTALL_DIR/lib/ardour9${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export ARDOUR_DATA_PATH="$INSTALL_DIR/share/ardour9"
+          export ARDOUR_CONFIG_PATH="$INSTALL_DIR/etc/ardour9"
+          export ARDOUR_DLL_PATH="$INSTALL_DIR/lib/ardour9"
           for sub in backends surfaces panners ctrl-interface; do
-            if [ -d "$INSTALL_DIR/lib/$LIB_NAME/$sub" ]; then
-              export ARDOUR_DLL_PATH="$ARDOUR_DLL_PATH:$INSTALL_DIR/lib/$LIB_NAME/$sub"
+            if [ -d "$INSTALL_DIR/lib/ardour9/$sub" ]; then
+              export ARDOUR_DLL_PATH="$ARDOUR_DLL_PATH:$INSTALL_DIR/lib/ardour9/$sub"
             fi
           done
-          export VAMP_PATH="$INSTALL_DIR/lib/$LIB_NAME"
-          exec "$INSTALL_DIR/bin/$LIB_NAME" "$@"
+          export VAMP_PATH="$INSTALL_DIR/lib/ardour9"
+          exec "$INSTALL_DIR/bin/$REAL_EXE" "$@"
           LAUNCHER_EOF
-          sed -i "s/__LIB_NAME__/${LIB_NAME}/" "$BUNDLE/${LIB_NAME}"
+          sed -i "s/__REAL_EXE__/${REAL_EXE}/" "$BUNDLE/${LIB_NAME}"
           chmod +x "$BUNDLE/${LIB_NAME}"
 
           ARTIFACT="ardour-${VERSION}-linux-x64.tar.gz"
@@ -450,38 +453,28 @@ jobs:
 
           mkdir -p "$CONTENTS/MacOS" "$LIBD" "$RESD"
 
-          # ---- 诊断：主程序的外部引用方式（@loader_path / 绝对路径 / rpath）----
-          echo "=== install/bin 主程序引用 ==="
-          otool -L "$INSTALL/bin/${LIB_NAME}" 2>/dev/null | head -n 12 || true
-          echo "=== 主程序 LC_RPATH ==="
-          otool -l "$INSTALL/bin/${LIB_NAME}" 2>/dev/null | grep -A2 LC_RPATH | head -n 12 || true
-
-          # ---- 主程序与辅助程序（vst/au scanner 等）----
-          for f in "$INSTALL"/bin/*; do
-            [ -f "$f" ] || continue
-            name="$(basename "$f")"
-            if [ "$name" = "${LIB_NAME}" ]; then
-              cp -a "$f" "$CONTENTS/MacOS/${APP_NAME}"
-            else
-              cp -a "$f" "$LIBD/" || true
-            fi
-          done
-          if [ ! -f "$CONTENTS/MacOS/${APP_NAME}" ]; then
-            echo "未找到主程序 ${LIB_NAME}，install/bin 内容如下："
-            ls "$INSTALL/bin" || true
-            exit 1
-          fi
-          chmod +x "$CONTENTS/MacOS/"*
-
-          # ---- 私有库（libardour.dylib、后端、控制面、LV2 等）----
-          # 完整保留安装树的内部相对结构（lib/ardour9/ 及其子目录），
-          # 因为 waf 在 darwin 上按安装布局重写了内部 dylib 的 @loader_path 引用
+          # ---- 私有库（真实主程序 ardour-9.8、libardour.dylib、后端、控制面、
+          # LV2 等）。注意：install/bin/ardour9 只是 shell 包装脚本（内含编译期
+          # 绝对路径），不可用；真实 GUI 主程序安装在 lib/ardour9/ 下 ----
           privlib="$(find "$INSTALL" -type d -name "${LIB_NAME}" -path '*/lib/*' | head -n 1)"
           if [ -z "$privlib" ]; then
-            echo "未找到私有库目录 ${LIB_NAME}"
+            echo "未找到私有库目录 ${LIB_NAME}，install 布局如下："
+            find "$INSTALL" -maxdepth 3 -type d || true
             exit 1
           fi
           cp -a "$privlib" "$LIBD/"
+          if [ ! -f "$LIBD/ardour-${VERSION}" ]; then
+            echo "未找到真实主程序 ${LIBD}/ardour-${VERSION}"
+            ls "$LIBD" | head -30 || true
+            exit 1
+          fi
+          cp -a "$LIBD/ardour-${VERSION}" "$CONTENTS/MacOS/${APP_NAME}"
+          rm -f "$LIBD/ardour-${VERSION}"
+          chmod +x "$CONTENTS/MacOS/${APP_NAME}"
+
+          # ---- 诊断：主程序的外部引用方式（@loader_path / 绝对路径 / rpath）----
+          echo "=== 主程序引用（打包前 12 行）==="
+          otool -L "$CONTENTS/MacOS/${APP_NAME}" 2>/dev/null | head -n 12 || true
           # clearlooks 主题引擎（官方 bundle 同款，双路径兼容）
           engine="$PWD/build/libs/clearlooks-newer/libclearlooks.dylib"
           if [ -f "$engine" ]; then
@@ -676,24 +669,20 @@ jobs:
           INST_UX="$PWD/install"
           mkdir -p "$DIST/bin" "$DIST/lib" "$DIST/share"
 
-          # ---- 安装树拷贝（bin/、lib/ardour9/、share/ardour9/、etc/）----
-          # waf 在 mingw 下把主程序安装为无扩展名的 ardour9，统一重命名为 .exe
-          if [ -f "$INST_UX/bin/${LIB_NAME}.exe" ]; then
-            : # 已是 .exe
-          elif [ -f "$INST_UX/bin/${LIB_NAME}" ]; then
-            if [ "$(head -c 2 "$INST_UX/bin/${LIB_NAME}" 2>/dev/null)" != "MZ" ]; then
-              echo "install/bin/${LIB_NAME} 不是 PE 可执行文件（缺少 MZ 头）"
-              exit 1
-            fi
-          else
-            echo "未找到主程序 ${LIB_NAME}[.exe]，install/bin 内容如下："
-            ls "$INST_UX/bin" || true
+          # ---- 安装树拷贝（bin/ 工具、lib/ardour9/ 内部库、share/、etc/）----
+          # 真实主程序是 install/lib/ardour9/ardour-9.8.exe（bin/ardour9 只是
+          # shell 包装脚本，含编译期绝对路径），移动到 DIST/bin/（exe 按自身
+          # 位置推导 ../share、../lib，与官方 Windows 安装布局一致）
+          if [ ! -f "$INST_UX/lib/${LIB_NAME}/ardour-${VERSION}.exe" ]; then
+            echo "未找到真实主程序 ${INST_UX}/lib/${LIB_NAME}/ardour-${VERSION}.exe"
+            ls "$INST_UX/lib/${LIB_NAME}" 2>/dev/null | head -20 || true
+            ls "$INST_UX/bin" 2>/dev/null | head -10 || true
             exit 1
           fi
           cp -a "$INST_UX/bin/." "$DIST/bin/"
-          if [ -f "$DIST/bin/${LIB_NAME}" ] && [ ! -f "$DIST/bin/${LIB_NAME}.exe" ]; then
-            mv "$DIST/bin/${LIB_NAME}" "$DIST/bin/${LIB_NAME}.exe"
-          fi
+          rm -f "$DIST/bin/${LIB_NAME}"
+          cp -a "$INST_UX/lib/${LIB_NAME}" "$DIST/lib/"
+          mv "$DIST/lib/${LIB_NAME}/ardour-${VERSION}.exe" "$DIST/bin/${LIB_NAME}.exe"
           cp -a "$INST_UX/lib/${LIB_NAME}" "$DIST/lib/"
           shareddir="$(find "$INST_UX" -type d -name "${LIB_NAME}" -path '*/share/*' | head -n 1)"
           if [ -z "$shareddir" ]; then
@@ -732,6 +721,7 @@ jobs:
           rem Ardour (Auto Build) 启动脚本
           setlocal
           set MAJOR=__MAJOR__
+          set PATH=%~dp0bin;%~dp0lib\ardour%MAJOR%;%PATH%
           set ARDOUR_DATA_PATH=%~dp0share\ardour%MAJOR%
           set ARDOUR_CONFIG_PATH=%~dp0etc\ardour%MAJOR%
           set ARDOUR_DLL_PATH=%~dp0bin;%~dp0lib\ardour%MAJOR%;%~dp0lib\ardour%MAJOR%\backends;%~dp0lib\ardour%MAJOR%\surfaces;%~dp0lib\ardour%MAJOR%\panners
