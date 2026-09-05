@@ -409,7 +409,7 @@ jobs:
           export PKG_CONFIG_PATH="$(echo "${HOMEBREW_PREFIX}"/opt/*/lib/pkgconfig | tr ' ' ':'):${HOMEBREW_PREFIX}/lib/pkgconfig:/usr/lib/pkgconfig"
           KEG_INC=""
           KEG_LIB=""
-          for p in libarchive libxml2 curl gettext readline zlib openssl@3 icu4c; do
+          for p in libarchive libxml2 curl gettext readline zlib openssl@3 icu4c raptor; do
             [ -d "${HOMEBREW_PREFIX}/opt/$p/include" ] && KEG_INC="${KEG_INC} -I${HOMEBREW_PREFIX}/opt/$p/include"
             [ -d "${HOMEBREW_PREFIX}/opt/$p/lib" ] && KEG_LIB="${KEG_LIB} -L${HOMEBREW_PREFIX}/opt/$p/lib"
           done
