@@ -64,7 +64,8 @@ permissions:
 
 env:
   # 只构建此版本及之后的稳定版（构建配方针对 9.x 验证）
-  MIN_VERSION: 9.0
+  # 注意：必须加引号，否则 YAML 会把 9.0 解析为数字导致 GH Actions 取整
+  MIN_VERSION: "9.0"
   # Ardour 官方源码仓库（GitHub 镜像）
   ARDOUR_REPO: https://github.com/Ardour/ardour.git
 
@@ -262,7 +263,7 @@ jobs:
             libx11-dev libxext-dev \
             libsndfile1-dev libflac-dev libogg-dev libsamplerate0-dev \
             libcurl4-openssl-dev libarchive-dev liblo-dev libtag1-dev \
-            libvamp-plugin-sdk-dev librubberband-dev \
+            vamp-plugin-sdk librubberband-dev \
             libasound2-dev libjack-jackd2-dev libpulse-dev \
             libusb-1.0-0-dev libhidapi-dev libdbus-1-dev \
             libwebsockets-dev libxml2-dev \
@@ -605,6 +606,10 @@ jobs:
           cd ardour
           PY="$(command -v python3 || command -v python)"
           echo "使用 Python：${PY}"
+          # runner 的 PATH 里带有 MSVC，必须显式指定 mingw gcc，
+          # 否则 waf（原生 Windows python）会优先检测到 MSVC
+          export CC=gcc
+          export CXX=g++
           # mingw python 是原生 Windows 程序，--prefix 必须用 Windows 路径
           PREFIX_WIN="$(cygpath -m "$PWD")/install"
           "$PY" ./waf configure \
