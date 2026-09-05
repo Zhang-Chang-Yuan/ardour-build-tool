@@ -400,9 +400,12 @@ jobs:
         run: |
           set -euo pipefail
           cd ardour
-          # Homebrew 的旧 API 版（keg-only）包需显式加入 pkg-config 路径
+          # Homebrew 的旧 API 版（keg-only）包需显式加入 pkg-config 路径；
+          # boost 检查不走 pkg-config，需通过 CPPFLAGS/LDFLAGS 加入 Homebrew 前缀
           HOMEBREW_PREFIX="$(brew --prefix)"
           export PKG_CONFIG_PATH="${HOMEBREW_PREFIX}/opt/glibmm@2.66/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/atkmm@2.28/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/pangomm@2.46/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/cairomm@1.14/lib/pkgconfig:${HOMEBREW_PREFIX}/opt/gettext/lib/pkgconfig:${HOMEBREW_PREFIX}/lib/pkgconfig:/usr/lib/pkgconfig"
+          export CPPFLAGS="-I${HOMEBREW_PREFIX}/include"
+          export LDFLAGS="-L${HOMEBREW_PREFIX}/lib"
           python3 ./waf configure \
             --prefix="$PWD/install" \
             --cxx17 \
